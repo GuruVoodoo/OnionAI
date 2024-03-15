@@ -22,6 +22,7 @@ RUN apt-get install -y \
     zlib1g-dev \
     gcc \
     g++ \
+    openssl \
     gdb \
     cmake \
     libpcre3-dev
