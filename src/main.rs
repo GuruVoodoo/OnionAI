@@ -3,6 +3,7 @@ mod error_handler;
 mod key;
 mod session;
 mod config;
+mod zk_proof;
 
 #[tokio::main]
 async fn main() {

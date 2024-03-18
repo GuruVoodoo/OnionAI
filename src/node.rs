@@ -15,6 +15,7 @@ use rand_chacha::ChaCha20Rng;
 use rand_core::{RngCore, SeedableRng};
 use crate::session;
 use crate::config::AppConfig;
+use crate::zk_proof::{generate_token_ownership_proof, verify_token_ownership_proof};
 
 // Import Result type
 use std::result::Result;
@@ -136,22 +137,47 @@ pub async fn run_server(config: AppConfig) {
                 Ok(_) => {
                     let mut session_cache_lock = session_cache_clone.lock().await;
                     if let Some(encrypted_data) = session_cache_lock.retrieve_session_data(&session_token) {
-                        // Session token found in cache, resume the session
-                        let session_key = session_cache_lock.derive_session_key(shared_secret.as_bytes(), b"salt", b"info");
-                        if let Some(decrypted_data) = session_cache_lock.decrypt_session_data(&encrypted_data, &session_key) {
-                            // Process the decrypted session data and continue the session
-                            // ...
-                            return;
+                        // Receive the token ownership proof from the client
+                        let mut proof_vec = Vec::new();
+                        tls_stream.read_to_end(&mut proof_vec).await.expect("Failed to receive proof");
+
+                        let mut verifying_key_vec = Vec::new();
+                        tls_stream.read_to_end(&mut verifying_key_vec).await.expect("Failed to receive verifying key");
+
+                        // Verify the token ownership proof
+                        let proof_result = verify_token_ownership_proof(&proof_vec, &verifying_key_vec)
+                            .expect("Failed to verify token ownership proof");
+
+                        if proof_result {
+                            // Session token found in cache and proof verified, resume the session
+                            let session_key = session_cache_lock.derive_session_key(shared_secret.as_bytes(), b"salt", b"info");
+                            if let Some(decrypted_data) = session_cache_lock.decrypt_session_data(&encrypted_data, &session_key) {
+                                // Process the decrypted session data and continue the session
+                                // ...
+                                return;
+                            }
+                        } else {
+                            // Token ownership proof verification failed, proceed with new session
+                            error_handler::log_and_display_error("Error: Token ownership proof verification failed", &"");
                         }
                     }
                 }
                 Err(_) => {
                     // Peer doesn't have a valid session token, proceed with new session
-                    error_handler::log_and_display_error("Error Peer presented an invalid Session Token", &"Invalid session token");
+                    error_handler::log_and_display_error("Error: Peer presented an invalid Session Token", &"Invalid session token");
                 }
             }
+            // Generate a new session token
             let session_token = session_cache_clone.lock().await.generate_session_token();
             let session_key = derive_encryption_key(&shared_secret).expect("Failed to derive encryption key");
+
+            // Generate the token ownership proof
+            let (proof_vec, verifying_key_vec) = generate_token_ownership_proof(&session_token)
+                .expect("Failed to generate token ownership proof");
+
+            // Send the proof and verifying key to the client
+            tls_stream.write_all(&proof_vec).await.expect("Failed to send proof");
+            tls_stream.write_all(&verifying_key_vec).await.expect("Failed to send verifying key");
 
             // Encrypt and store the session data in the cache
             let session_data = b"some_session_data";
