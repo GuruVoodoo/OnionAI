@@ -4,6 +4,8 @@ mod key;
 mod session;
 mod config;
 mod zk_proof;
+mod encryption;
+mod client;
 
 #[tokio::main]
 async fn main() {

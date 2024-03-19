@@ -7,6 +7,8 @@ use std::fs;
 pub struct AppConfig {
     #[serde(with = "serde_duration")]
     pub session_lifetime: Duration,
+    pub listen_address: String,
+    pub listen_port: u16,
 }
 
 impl AppConfig {
@@ -18,6 +20,8 @@ impl AppConfig {
             let default_config = r#"
                 [default]
                 session_lifetime_seconds = 3600
+                listen_address = "127.0.0.1"
+                listen_port = 8080
             "#;
             fs::write("config.ini", default_config).expect("Failed to create config.ini");
         }
@@ -29,9 +33,17 @@ impl AppConfig {
 
         let session_lifetime_seconds = conf.get_int("default.session_lifetime_seconds")
             .expect("Failed to get session_lifetime_seconds") as u64;
+        let listen_address = conf.get_string("default.listen_address")
+            .expect("Failed to get listen_address");
+        let listen_port = conf.get_int("default.listen_port")
+            .expect("Failed to get listen_port") as u16;
+
 
         AppConfig {
             session_lifetime: Duration::from_secs(session_lifetime_seconds),
+            listen_address,
+            listen_port,
+
         }
     }
 }

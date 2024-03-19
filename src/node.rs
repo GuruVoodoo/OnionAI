@@ -1,3 +1,4 @@
+use native_tls;
 use tokio::sync::Mutex;
 use tokio_native_tls::TlsStream;
 use std::sync::Arc;
@@ -6,21 +7,16 @@ use tokio::net::TcpListener;
 use std::net::SocketAddr;
 use uuid::Uuid;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
-use x25519_dalek::{EphemeralSecret, PublicKey, SharedSecret};
-use sodiumoxide::crypto::secretbox;
 use sodiumoxide::crypto::secretbox::{Key, Nonce};
-use hkdf::Hkdf;
-use sha2::Sha256;
-use rand_chacha::ChaCha20Rng;
-use rand_core::{RngCore, SeedableRng};
+use sodiumoxide::crypto::secretbox;
 use crate::session;
 use crate::config::AppConfig;
 use crate::zk_proof::{generate_token_ownership_proof, verify_token_ownership_proof};
+use crate::encryption;
+use x25519_dalek::PublicKey;
 
 // Import Result type
 use std::result::Result;
-
-type Error = Box<dyn std::error::Error + Send + Sync>;
 
 // Type alias for connection map
 type ConnectionMap = HashMap<String, Arc<Mutex<TlsStream<tokio::net::TcpStream>>>>;
@@ -57,7 +53,9 @@ pub async fn run_server(config: AppConfig) {
     };
 
     // (TLS initialization, listener creation, and connection HashMap creation)
-    let addr = "127.0.0.1:8080".parse::<SocketAddr>().unwrap();
+    let addr = format!("{}:{}", config.listen_address, config.listen_port)
+        .parse::<SocketAddr>()
+        .unwrap();
     let listener = TcpListener::bind(&addr).await.unwrap();
 
     // TLS Key initialization
@@ -88,12 +86,7 @@ pub async fn run_server(config: AppConfig) {
         };
 
         // Perform x25519 Diffie-Hellman key exchange
-        let (ephemeral_secret, ephemeral_public) = {
-            let mut rng = ChaCha20Rng::from_seed(generate_secure_seed());
-            let ephemeral_secret = EphemeralSecret::random_from_rng(&mut rng);
-            let ephemeral_public = PublicKey::from(&ephemeral_secret); // <-- Derive public key before move
-            (ephemeral_secret, ephemeral_public)
-        };
+        let (ephemeral_secret, ephemeral_public) = encryption::generate_key_pair();
 
         // Share public key with the other party
         let public_key_bytes = ephemeral_public.as_bytes().to_vec();
@@ -107,7 +100,6 @@ pub async fn run_server(config: AppConfig) {
             // Access and use the cloned tls_stream within the closure
             let mut tls_stream_mutex = tls_stream_clone.lock().await;
             tls_stream_mutex.write_all(&public_key_bytes).await.expect("Failed to send public key");
-
             let mut tls_stream = tls_stream_mutex; // Obtain a mutable reference
 
             // Diffie-Hellman key exchange and shared secret derivation
@@ -129,7 +121,13 @@ pub async fn run_server(config: AppConfig) {
             };
 
             let shared_secret = ephemeral_secret.diffie_hellman(&peer_public);
-            let encryption_key = derive_encryption_key(&shared_secret).expect("Failed to derive encryption key");
+            let encryption_key = match encryption::derive_encryption_key(&shared_secret) {
+                Ok(key) => key,
+                Err(e) => {
+                    error_handler::log_and_display_error("Failed to derive encryption key", &e);
+                    return;
+                }
+            };
 
             // Check if the Peer has a valid session token
             let mut session_token = [0u8; 32];
@@ -169,7 +167,7 @@ pub async fn run_server(config: AppConfig) {
             }
             // Generate a new session token
             let session_token = session_cache_clone.lock().await.generate_session_token();
-            let session_key = derive_encryption_key(&shared_secret).expect("Failed to derive encryption key");
+            let session_key = encryption::derive_encryption_key(&shared_secret).expect("Failed to derive encryption key");
 
             // Generate the token ownership proof
             let (proof_vec, verifying_key_vec) = generate_token_ownership_proof(&session_token)
@@ -188,7 +186,11 @@ pub async fn run_server(config: AppConfig) {
             tls_stream.write_all(&session_token).await.expect("Failed to send session token");
 
             let connections_clone = connections_clone.clone();
-            tokio::spawn(handle_connection(generate_connection_id(), connections_clone, encryption_key));
+            tokio::spawn(handle_connection(
+                generate_connection_id(),
+                connections_clone,
+                encryption::derive_encryption_key(&shared_secret),
+            ));
         });
 
         // Periodically remove expired sessions from the cache
@@ -207,7 +209,7 @@ fn generate_connection_id() -> String {
 async fn handle_connection(
     connection_id: String,
     connections: Arc<Mutex<ConnectionMap>>,
-    encryption_key_vec: Vec<u8>,
+    encryption_key_result: Result<Vec<u8>, hkdf::InvalidLength>,
 ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     println!("WebSocket connection established for ID: {}", connection_id);
 
@@ -218,7 +220,19 @@ async fn handle_connection(
     };
 
     // Convert the Vec<u8> encryption key to a Key type
-    let encryption_key = Key::from_slice(&encryption_key_vec).unwrap();
+    let encryption_key = match encryption_key_result {
+        Ok(key) => match Key::from_slice(&key) {
+            Some(k) => k,
+            None => {
+                error_handler::log_and_display_error("Failed to create encryption key", &"");
+                return Err("Failed to create encryption key".into());
+            }
+        },
+        Err(e) => {
+            error_handler::log_and_display_error("Failed to derive encryption key", &e);
+            return Err("Failed to derive encryption key".into());
+        }
+    };
 
     let mut tls_stream = tls_stream_mutex.lock().await;
 
@@ -234,7 +248,7 @@ async fn handle_connection(
         let nonce = Nonce::from_slice(&nonce_bytes).unwrap();
 
         // Decrypt the incoming data
-        let plaintext = match decrypt(&buf[..n], &encryption_key, &nonce) {
+        let plaintext = match encryption::decrypt(&buf[..n], &encryption_key, &nonce) {
             Some(plaintext) => plaintext,
             None => {
                 // Handle decryption failure
@@ -248,7 +262,7 @@ async fn handle_connection(
 
         // Encrypt a response message
         let response = b"Hello, client!";
-        let ciphertext = encrypt(response, &encryption_key, &nonce);
+        let ciphertext = encryption::encrypt(response, &encryption_key, &nonce);
 
         // Send the encrypted response back to the client
         tls_stream.write_all(&ciphertext).await.expect("Failed to send response");
@@ -258,40 +272,4 @@ async fn handle_connection(
     connections.lock().await.remove(&connection_id);
 
     Ok(())
-}
-fn derive_encryption_key(shared_secret: &SharedSecret) -> Result<Vec<u8>, hkdf::InvalidLength> {
-    let salt = sodiumoxide::randombytes::randombytes(32); // Generate random salt
-    let info = b"encryption_key";
-
-    let hkdf = Hkdf::<Sha256>::new(Some(&salt), shared_secret.as_bytes());  // Correct arguments for Hkdf::new
-    let mut key_material = vec![0u8; 32]; // Create a mutable buffer for key material
-
-    hkdf.expand(info, &mut key_material)?; // Use mutable reference and handle Result
-
-    Ok(key_material) // Return the derived key material
-}
-
-fn encrypt(message: &[u8], key: &Key, nonce: &Nonce) -> Vec<u8> {
-    let ciphertext = secretbox::seal(message, nonce, key);
-    let mut pmc_ciphertext = Vec::new();
-    pmc_ciphertext.extend_from_slice(&ciphertext[0..16]); // PMC header
-    pmc_ciphertext.extend_from_slice(&ciphertext[24..]); // PMC encrypted message
-    pmc_ciphertext
-}
-
-fn decrypt(ciphertext: &[u8], key: &Key, nonce: &Nonce) -> Option<Vec<u8>> {
-    let mut full_ciphertext = Vec::with_capacity(ciphertext.len() + 16);
-    full_ciphertext.extend_from_slice(&ciphertext[0..16]); // PMC header
-    full_ciphertext.extend_from_slice(&[0u8; 8]); // PMC placeholder
-    full_ciphertext.extend_from_slice(&ciphertext[16..]); // PMC encrypted message
-
-    secretbox::open(&full_ciphertext, nonce, key).ok()
-}
-
-fn generate_secure_seed() -> [u8; 32] {
-    // Generate a secure random seed for the CSPRNG
-    let mut seed = [0u8; 32];
-    // Use a secure source of randomness to fill the seed, e.g., OsRng
-    rand::rngs::OsRng.fill_bytes(&mut seed);
-    seed
 }
