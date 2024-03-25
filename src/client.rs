@@ -7,14 +7,10 @@ use sodiumoxide::crypto::secretbox::{Key, Nonce};
 use std::fs;
 use std::net::SocketAddr;
 use std::path::Path;
-use std::time::Duration;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::TcpStream;
 use tokio_native_tls::TlsConnector;
 use x25519_dalek::PublicKey;
-
-const MAX_RECONNECT_ATTEMPTS: usize = 5;
-const RECONNECT_DELAY: Duration = Duration::from_secs(5);
 
 pub async fn connect_to_node(
     config: AppConfig,
@@ -28,23 +24,23 @@ pub async fn connect_to_node(
             Err(e) => {
                 error_handler::log_and_display_error("Failed to establish TLS connection", &e);
                 reconnect_attempts += 1;
-                if reconnect_attempts >= MAX_RECONNECT_ATTEMPTS {
+                if reconnect_attempts >= config.max_reconnect_attempts {
                     return Err("Max reconnect attempts reached".into());
                 }
-                tokio::time::sleep(RECONNECT_DELAY).await;
+                tokio::time::sleep(config.reconnect_delay).await;
                 continue;
             }
         };
 
-        let (shared_secret, encryption_key) = match perform_key_exchange(&mut tls_stream).await {
-            Ok(result) => result,
+        let encryption_key = match perform_key_exchange(&mut tls_stream).await {
+            Ok(key) => key,
             Err(e) => {
                 error_handler::log_and_display_error("Failed to perform key exchange", &e);
                 reconnect_attempts += 1;
-                if reconnect_attempts >= MAX_RECONNECT_ATTEMPTS {
+                if reconnect_attempts >= config.max_reconnect_attempts {
                     return Err("Max reconnect attempts reached".into());
                 }
-                tokio::time::sleep(RECONNECT_DELAY).await;
+                tokio::time::sleep(config.reconnect_delay).await;
                 continue;
             }
         };
@@ -54,10 +50,10 @@ pub async fn connect_to_node(
             Err(e) => {
                 error_handler::log_and_display_error("Failed to get or receive session token", &e);
                 reconnect_attempts += 1;
-                if reconnect_attempts >= MAX_RECONNECT_ATTEMPTS {
+                if reconnect_attempts >= config.max_reconnect_attempts {
                     return Err("Max reconnect attempts reached".into());
                 }
-                tokio::time::sleep(RECONNECT_DELAY).await;
+                tokio::time::sleep(config.reconnect_delay).await;
                 continue;
             }
         };
@@ -65,22 +61,22 @@ pub async fn connect_to_node(
         if let Err(e) = send_proof_and_verifying_key(&mut tls_stream, &session_token).await {
             error_handler::log_and_display_error("Failed to send proof and verifying key", &e);
             reconnect_attempts += 1;
-            if reconnect_attempts >= MAX_RECONNECT_ATTEMPTS {
+            if reconnect_attempts >= config.max_reconnect_attempts {
                 return Err("Max reconnect attempts reached".into());
             }
-            tokio::time::sleep(RECONNECT_DELAY).await;
+            tokio::time::sleep(config.reconnect_delay).await;
             continue;
         }
 
         let session_token_array: [u8; 32] = session_token.try_into().unwrap();
 
-        if let Err(e) = handle_connection(&mut tls_stream, &encryption_key, &session_token_array).await {
+        if let Err(e) = handle_connection(&mut tls_stream, &encryption_key, &session_token_array, &config).await {
             error_handler::log_and_display_error("Connection error", &e);
             reconnect_attempts += 1;
-            if reconnect_attempts >= MAX_RECONNECT_ATTEMPTS {
+            if reconnect_attempts >= config.max_reconnect_attempts {
                 return Err("Max reconnect attempts reached".into());
             }
-            tokio::time::sleep(RECONNECT_DELAY).await;
+            tokio::time::sleep(config.reconnect_delay).await;
         } else {
             break;
         }
@@ -100,7 +96,7 @@ async fn establish_tls_connection(
 
 async fn perform_key_exchange(
     tls_stream: &mut tokio_native_tls::TlsStream<tokio::net::TcpStream>,
-) -> Result<(x25519_dalek::SharedSecret, Vec<u8>), Box<dyn std::error::Error + Send + Sync>> {
+) -> Result<Vec<u8>, Box<dyn std::error::Error + Send + Sync>> {
     let (ephemeral_secret, ephemeral_public) = encryption::generate_key_pair();
     let public_key_bytes = ephemeral_public.as_bytes().to_vec();
     tls_stream.write_all(&public_key_bytes).await?;
@@ -113,7 +109,7 @@ async fn perform_key_exchange(
     let encryption_key = encryption::derive_encryption_key(&shared_secret)
         .map_err(|e| format!("Failed to derive encryption key: {}", e))?;
 
-    Ok((shared_secret, encryption_key))
+    Ok(encryption_key)
 }
 
 async fn get_or_receive_session_token(
@@ -147,12 +143,21 @@ async fn handle_connection(
     tls_stream: &mut tokio_native_tls::TlsStream<tokio::net::TcpStream>,
     encryption_key: &[u8],
     session_token: &[u8; 32],
+    config: &AppConfig,
 ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     let encryption_key = Key::from_slice(encryption_key).unwrap();
     fs::write("session_token.bin", session_token)?;
 
     let mut buf = [0u8; 1024];
+    let start_time = std::time::Instant::now();
+
     loop {
+        let elapsed_time = start_time.elapsed();
+        if elapsed_time >= config.session_lifetime {
+            // Session has reached its maximum duration, renegotiate the session
+            return Ok(());
+        }
+
         let n = match tls_stream.read(&mut buf).await {
             Ok(n) if n == 0 => break,
             Ok(n) => n,

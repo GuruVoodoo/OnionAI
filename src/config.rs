@@ -9,8 +9,10 @@ pub struct AppConfig {
     pub session_lifetime: Duration,
     pub listen_address: String,
     pub listen_port: u16,
+    pub max_reconnect_attempts: usize,
+    #[serde(with = "serde_duration")]
+    pub reconnect_delay: Duration,
 }
-
 impl AppConfig {
     pub fn new() -> Self {
         let builder = Config::builder();
@@ -22,6 +24,8 @@ impl AppConfig {
                 session_lifetime_seconds = 3600
                 listen_address = "127.0.0.1"
                 listen_port = 8080
+                max_reconnect_attempts = 5
+                reconnect_delay_seconds = 5
             "#;
             fs::write("config.ini", default_config).expect("Failed to create config.ini");
         }
@@ -37,13 +41,17 @@ impl AppConfig {
             .expect("Failed to get listen_address");
         let listen_port = conf.get_int("default.listen_port")
             .expect("Failed to get listen_port") as u16;
-
+        let max_reconnect_attempts = conf.get_int("default.max_reconnect_attempts")
+            .expect("Failed to get max_reconnect_attempts") as usize;
+        let reconnect_delay_seconds = conf.get_int("default.reconnect_delay_seconds")
+            .expect("Failed to get reconnect_delay_seconds") as u64;
 
         AppConfig {
             session_lifetime: Duration::from_secs(session_lifetime_seconds),
             listen_address,
             listen_port,
-
+            max_reconnect_attempts,
+            reconnect_delay: Duration::from_secs(reconnect_delay_seconds),
         }
     }
 }
