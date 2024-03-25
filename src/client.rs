@@ -90,7 +90,23 @@ async fn establish_tls_connection(
 ) -> Result<tokio_native_tls::TlsStream<tokio::net::TcpStream>, Box<dyn std::error::Error + Send + Sync>> {
     let stream = TcpStream::connect(target_addr).await?;
     let tls_connector = TlsConnector::from(native_tls::TlsConnector::new()?);
-    let tls_stream = tls_connector.connect("localhost", stream).await?;
+    let mut tls_stream = tls_connector.connect("localhost", stream).await?;
+
+    // Receive the TLS certificate proof and verifying key from the server
+    let mut tls_certificate_proof = Vec::new();
+    tls_stream.read_to_end(&mut tls_certificate_proof).await?;
+
+    let mut tls_certificate_verifying_key = Vec::new();
+    tls_stream.read_to_end(&mut tls_certificate_verifying_key).await?;
+
+    // Verify the TLS certificate proof
+    let tls_certificate_proof_result = crate::zk_proof::verify_tls_certificate_proof(&tls_certificate_proof, &tls_certificate_verifying_key)
+        .map_err(|e| format!("Failed to verify TLS certificate proof: {}", e))?;
+
+    if !tls_certificate_proof_result {
+        error_handler::log_warning("Warning: Potential MITM attack or NGFW detected. TLS certificate proof verification failed.");
+    }
+
     Ok(tls_stream)
 }
 
@@ -98,14 +114,27 @@ async fn perform_key_exchange(
     tls_stream: &mut tokio_native_tls::TlsStream<tokio::net::TcpStream>,
 ) -> Result<Vec<u8>, Box<dyn std::error::Error + Send + Sync>> {
     let (ephemeral_secret, ephemeral_public) = encryption::generate_key_pair();
+
+    // Generate the TLS certificate proof
+    let peer_cert = tls_stream.get_ref().peer_certificate().unwrap().unwrap();
+    let der_cert = peer_cert.to_der().unwrap();
+    let (tls_certificate_proof, tls_certificate_verifying_key) = crate::zk_proof::generate_tls_certificate_proof(&der_cert)
+        .map_err(|e| format!("Failed to generate TLS certificate proof: {}", e))?;
+
+    // Send the TLS certificate proof and verifying key to the server
+    tls_stream.write_all(&tls_certificate_proof).await?;
+    tls_stream.write_all(&tls_certificate_verifying_key).await?;
+
+    // Receive the server's public key
+    let mut server_public_bytes = [0u8; 32];
+    tls_stream.read_exact(&mut server_public_bytes).await?;
+    let server_public = PublicKey::from(server_public_bytes);
+
+    // Send the client's public key to the server
     let public_key_bytes = ephemeral_public.as_bytes().to_vec();
     tls_stream.write_all(&public_key_bytes).await?;
 
-    let mut peer_public_bytes = [0u8; 32];
-    tls_stream.read_exact(&mut peer_public_bytes).await?;
-    let peer_public = PublicKey::from(peer_public_bytes);
-
-    let shared_secret = ephemeral_secret.diffie_hellman(&peer_public);
+    let shared_secret = ephemeral_secret.diffie_hellman(&server_public);
     let encryption_key = encryption::derive_encryption_key(&shared_secret)
         .map_err(|e| format!("Failed to derive encryption key: {}", e))?;
 

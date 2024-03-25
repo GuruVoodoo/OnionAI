@@ -11,7 +11,7 @@ use sodiumoxide::crypto::secretbox::{Key, Nonce};
 use sodiumoxide::crypto::secretbox;
 use crate::session;
 use crate::config::AppConfig;
-use crate::zk_proof::{generate_token_ownership_proof, verify_token_ownership_proof};
+use crate::zk_proof::{generate_token_ownership_proof, verify_token_ownership_proof,generate_tls_certificate_proof, verify_tls_certificate_proof};
 use crate::encryption;
 use x25519_dalek::PublicKey;
 
@@ -80,10 +80,31 @@ pub async fn run_server(config: AppConfig) {
             Ok(tls_stream) => Arc::new(Mutex::new(tls_stream)),
             Err(e) => {
                 // Handle TLS handshake error using the error handler
-                error_handler::log_and_display_error("Error during Diffie-Hellman key exchange", &e);
+                error_handler::log_and_display_error("Error during TLS Handshake", &e);
                 continue;
             }
         };
+
+        // Generate the TLS certificate proof
+        match tls_stream.lock().await.get_ref().peer_certificate() {
+            Ok(Some(certificate)) => {
+                let der_cert = certificate.to_der().expect("Failed to encode certificate to DER");
+                let (tls_certificate_proof, tls_certificate_verifying_key) = generate_tls_certificate_proof(&der_cert)
+                    .expect("Failed to generate TLS certificate proof");
+
+                // Send the TLS certificate proof and verifying key to the client
+                tls_stream.lock().await.write_all(&tls_certificate_proof).await.expect("Failed to send TLS certificate proof");
+                tls_stream.lock().await.write_all(&tls_certificate_verifying_key).await.expect("Failed to send TLS certificate verifying key");
+            },
+            Ok(None) => {
+                error_handler::log_and_display_error("Error: No peer certificate found", &"");
+                continue;
+            },
+            Err(e) => {
+                error_handler::log_and_display_error("Error retrieving peer certificate", &e);
+                continue;
+            }
+        }
 
         // Perform x25519 Diffie-Hellman key exchange
         let (ephemeral_secret, ephemeral_public) = encryption::generate_key_pair();
@@ -101,6 +122,22 @@ pub async fn run_server(config: AppConfig) {
             let mut tls_stream_mutex = tls_stream_clone.lock().await;
             tls_stream_mutex.write_all(&public_key_bytes).await.expect("Failed to send public key");
             let mut tls_stream = tls_stream_mutex; // Obtain a mutable reference
+
+            // Receive the TLS certificate proof and verifying key from the client
+            let mut tls_certificate_proof = Vec::new();
+            tls_stream.read_to_end(&mut tls_certificate_proof).await.expect("Failed to receive TLS certificate proof");
+
+            let mut tls_certificate_verifying_key = Vec::new();
+            tls_stream.read_to_end(&mut tls_certificate_verifying_key).await.expect("Failed to receive TLS certificate verifying key");
+
+            // Verify the TLS certificate proof
+            let tls_certificate_proof_result = verify_tls_certificate_proof(&tls_certificate_proof, &tls_certificate_verifying_key)
+                .expect("Failed to verify TLS certificate proof");
+
+            if !tls_certificate_proof_result {
+                error_handler::log_warning("Warning: Potential MITM attack or NGFW detected. TLS certificate proof verification failed.");
+            }
+
 
             // Diffie-Hellman key exchange and shared secret derivation
             let peer_public = match tls_stream.read_exact(&mut [0u8; 32]).await {

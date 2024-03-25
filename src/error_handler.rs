@@ -1,5 +1,6 @@
 // error_handler.rs
 
+use log::warn;
 use log::{error, info};
 use env_logger::{Builder, Env};
 
@@ -26,4 +27,8 @@ pub fn log_and_display_error(message: &str, error: &dyn std::fmt::Debug) {
     // Display the error to the user or handle it as needed
     // Here, we simply print it to the console
     eprintln!("Error: {}: {:?}", message, error);
+}
+
+pub fn log_warning(message: &str) {
+    warn!("{}", message);
 }
