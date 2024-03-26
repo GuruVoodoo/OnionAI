@@ -1,7 +1,7 @@
 use crate::config::AppConfig;
 use crate::encryption;
 use crate::error_handler;
-use crate::zk_proof::generate_token_ownership_proof;
+use crate::zk_proof::{generate_token_ownership_proof,generate_tls_certificate_proof, verify_tls_certificate_proof, generate_pfs_public_key_proof, verify_pfs_public_key_proof};
 use sodiumoxide::crypto::secretbox;
 use sodiumoxide::crypto::secretbox::{Key, Nonce};
 use std::fs;
@@ -100,7 +100,7 @@ async fn establish_tls_connection(
     tls_stream.read_to_end(&mut tls_certificate_verifying_key).await?;
 
     // Verify the TLS certificate proof
-    let tls_certificate_proof_result = crate::zk_proof::verify_tls_certificate_proof(&tls_certificate_proof, &tls_certificate_verifying_key)
+    let tls_certificate_proof_result = verify_tls_certificate_proof(&tls_certificate_proof, &tls_certificate_verifying_key)
         .map_err(|e| format!("Failed to verify TLS certificate proof: {}", e))?;
 
     if !tls_certificate_proof_result {
@@ -118,7 +118,7 @@ async fn perform_key_exchange(
     // Generate the TLS certificate proof
     let peer_cert = tls_stream.get_ref().peer_certificate().unwrap().unwrap();
     let der_cert = peer_cert.to_der().unwrap();
-    let (tls_certificate_proof, tls_certificate_verifying_key) = crate::zk_proof::generate_tls_certificate_proof(&der_cert)
+    let (tls_certificate_proof, tls_certificate_verifying_key) = generate_tls_certificate_proof(&der_cert)
         .map_err(|e| format!("Failed to generate TLS certificate proof: {}", e))?;
 
     // Send the TLS certificate proof and verifying key to the server
@@ -134,7 +134,46 @@ async fn perform_key_exchange(
     let public_key_bytes = ephemeral_public.as_bytes().to_vec();
     tls_stream.write_all(&public_key_bytes).await?;
 
-    let shared_secret = ephemeral_secret.diffie_hellman(&server_public);
+    let shared_secret: x25519_dalek::SharedSecret;
+
+    // Verify the TLS certificate proof
+    let tls_certificate_proof_result = verify_tls_certificate_proof(&tls_certificate_proof, &tls_certificate_verifying_key)
+        .map_err(|e| format!("Failed to verify TLS certificate proof: {}", e))?;
+
+    if !tls_certificate_proof_result {
+        error_handler::log_warning("Warning: Potential MITM attack or NGFW detected. TLS certificate proof verification failed.");
+
+        // Receive the server's PFS public key proof and verifying key
+        let mut server_pfs_proof = Vec::new();
+        tls_stream.read_to_end(&mut server_pfs_proof).await?;
+
+        let mut server_pfs_verifying_key = Vec::new();
+        tls_stream.read_to_end(&mut server_pfs_verifying_key).await?;
+
+        // Verify the server's PFS public key proof
+        let server_pfs_proof_result = verify_pfs_public_key_proof(&server_pfs_proof, &server_pfs_verifying_key)
+            .map_err(|e| format!("Failed to verify server's PFS public key proof: {}", e))?;
+
+        if !server_pfs_proof_result {
+            error_handler::log_and_display_error("Server's PFS public key proof verification failed. Authentication tampered with mid-stream.", &"");
+            return Err("Server's PFS public key proof verification failed".into());
+        }
+
+        // Generate the client's PFS public key proof
+        let (client_pfs_proof, client_pfs_verifying_key) = generate_pfs_public_key_proof(ephemeral_public.as_bytes())
+            .map_err(|e| format!("Failed to generate client's PFS public key proof: {}", e))?;
+
+        // Send the client's PFS public key proof and verifying key to the server
+        tls_stream.write_all(&client_pfs_proof).await?;
+        tls_stream.write_all(&client_pfs_verifying_key).await?;
+
+        // Derive the shared secret using the client's ephemeral secret key and the server's public key
+        shared_secret = ephemeral_secret.diffie_hellman(&server_public);
+    } else {
+        // Derive the shared secret using the client's ephemeral secret key and the server's public key
+        shared_secret = ephemeral_secret.diffie_hellman(&server_public);
+    }
+
     let encryption_key = encryption::derive_encryption_key(&shared_secret)
         .map_err(|e| format!("Failed to derive encryption key: {}", e))?;
 

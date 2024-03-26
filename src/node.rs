@@ -11,7 +11,7 @@ use sodiumoxide::crypto::secretbox::{Key, Nonce};
 use sodiumoxide::crypto::secretbox;
 use crate::session;
 use crate::config::AppConfig;
-use crate::zk_proof::{generate_token_ownership_proof, verify_token_ownership_proof,generate_tls_certificate_proof, verify_tls_certificate_proof};
+use crate::zk_proof::{generate_token_ownership_proof, verify_token_ownership_proof,generate_tls_certificate_proof, verify_tls_certificate_proof, generate_pfs_public_key_proof, verify_pfs_public_key_proof};
 use crate::encryption;
 use x25519_dalek::PublicKey;
 
@@ -134,37 +134,64 @@ pub async fn run_server(config: AppConfig) {
             let tls_certificate_proof_result = verify_tls_certificate_proof(&tls_certificate_proof, &tls_certificate_verifying_key)
                 .expect("Failed to verify TLS certificate proof");
 
+            let shared_secret: x25519_dalek::SharedSecret;
+
             if !tls_certificate_proof_result {
                 error_handler::log_warning("Warning: Potential MITM attack or NGFW detected. TLS certificate proof verification failed.");
-            }
 
+                // Generate the PFS public key proof
+                let (server_pfs_proof, server_pfs_verifying_key) = generate_pfs_public_key_proof(ephemeral_public.as_bytes())
+                    .expect("Failed to generate server's PFS public key proof");
 
-            // Diffie-Hellman key exchange and shared secret derivation
-            let peer_public = match tls_stream.read_exact(&mut [0u8; 32]).await {
-                Ok(n) => {
-                    if n != 32 {
-                        // Handle invalid key size
+                // Send the server's PFS public key proof and verifying key to the client
+                tls_stream.write_all(&server_pfs_proof).await.expect("Failed to send server's PFS public key proof");
+                tls_stream.write_all(&server_pfs_verifying_key).await.expect("Failed to send server's PFS public key verifying key");
+
+                // Receive the client's PFS public key proof and verifying key
+                let mut client_pfs_proof = Vec::new();
+                tls_stream.read_to_end(&mut client_pfs_proof).await.expect("Failed to receive client's PFS public key proof");
+
+                let mut client_pfs_verifying_key = Vec::new();
+                tls_stream.read_to_end(&mut client_pfs_verifying_key).await.expect("Failed to receive client's PFS public key verifying key");
+
+                // Verify the client's PFS public key proof
+                let client_pfs_proof_result = verify_pfs_public_key_proof(&client_pfs_proof, &client_pfs_verifying_key)
+                    .expect("Failed to verify client's PFS public key proof");
+
+                if !client_pfs_proof_result {
+                    error_handler::log_and_display_error("Client's PFS public key proof verification failed. Authentication tampered with mid-stream.", &"");
+                    return;
+                }
+
+                // Receive the client's public key
+                let mut client_public_bytes = [0u8; 32];
+                tls_stream.read_exact(&mut client_public_bytes).await.expect("Failed to receive client's public key");
+                let client_public = PublicKey::from(client_public_bytes);
+
+                // Derive the shared secret using the server's ephemeral secret key and the client's public key
+                shared_secret = ephemeral_secret.diffie_hellman(&client_public);
+            } else {
+                // Diffie-Hellman key exchange and shared secret derivation
+                let peer_public = match tls_stream.read_exact(&mut [0u8; 32]).await {
+                    Ok(n) => {
+                        if n != 32 {
+                            // Handle invalid key size
+                            error_handler::log_and_display_error("Invalid public key size received from peer", &"");
+                            return;
+                        }
+                        let mut key_bytes = [0u8; 32];
+                        tls_stream.read_exact(&mut key_bytes).await.expect("Failed to read peer public key");
+                        PublicKey::from(key_bytes)
+                    }
+                    Err(e) => {
+                        // Handle TLS handshake error using the error handler
+                        error_handler::log_and_display_error("Error during Diffie-Hellman key exchange", &e);
                         return;
                     }
-                    let mut key_bytes = [0u8; 32];
-                    tls_stream.read_exact(&mut key_bytes).await.expect("Failed to read peer public key");
-                    PublicKey::from(key_bytes)
-                }
-                Err(e) => {
-                    // Handle TLS handshake error using the error handler
-                    error_handler::log_and_display_error("Error during Diffie-Hellman key exchange", &e);
-                    return;
-                }
-            };
+                };
 
-            let shared_secret = ephemeral_secret.diffie_hellman(&peer_public);
-            let encryption_key = match encryption::derive_encryption_key(&shared_secret) {
-                Ok(key) => key,
-                Err(e) => {
-                    error_handler::log_and_display_error("Failed to derive encryption key", &e);
-                    return;
-                }
-            };
+                shared_secret = ephemeral_secret.diffie_hellman(&peer_public);
+            }
 
             // Check if the Peer has a valid session token
             let mut session_token = [0u8; 32];
