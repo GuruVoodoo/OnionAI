@@ -13,6 +13,7 @@ pub struct AppConfig {
     #[serde(with = "serde_duration")]
     pub reconnect_delay: Duration,
 }
+
 impl AppConfig {
     pub fn new() -> Self {
         let builder = Config::builder();
@@ -20,18 +21,43 @@ impl AppConfig {
         // Check if config.ini exists, if not, create it with a prepopulated value
         if !fs::metadata("config.ini").is_ok() {
             let default_config = r#"
-                [default]
-                session_lifetime_seconds = 3600
-                listen_address = "127.0.0.1"
-                listen_port = 8080
-                max_reconnect_attempts = 5
-                reconnect_delay_seconds = 5
+            session_lifetime_seconds = 3600
+            listen_address = "127.0.0.1"
+            listen_port = 8080
+            max_reconnect_attempts = 5
+            reconnect_delay_seconds = 5
             "#;
             fs::write("config.ini", default_config).expect("Failed to create config.ini");
         }
 
         let conf = builder
             .add_source(config::File::new("config.ini", FileFormat::Ini))
+            .build()
+            .expect("Failed to build configuration");
+
+        let session_lifetime_seconds = conf.get_int("session_lifetime_seconds")
+            .expect("Failed to get session_lifetime_seconds") as u64;
+        let listen_address = conf.get_string("listen_address")
+            .expect("Failed to get listen_address");
+        let listen_port = conf.get_int("listen_port")
+            .expect("Failed to get listen_port") as u16;
+        let max_reconnect_attempts = conf.get_int("max_reconnect_attempts")
+            .expect("Failed to get max_reconnect_attempts") as usize;
+        let reconnect_delay_seconds = conf.get_int("reconnect_delay_seconds")
+            .expect("Failed to get reconnect_delay_seconds") as u64;
+
+        AppConfig {
+            session_lifetime: Duration::from_secs(session_lifetime_seconds),
+            listen_address,
+            listen_port,
+            max_reconnect_attempts,
+            reconnect_delay: Duration::from_secs(reconnect_delay_seconds),
+        }
+    }
+
+    pub fn load_from_file(file_path: &str) -> Self {
+        let conf = Config::builder()
+            .add_source(config::File::new(file_path, FileFormat::Ini))
             .build()
             .expect("Failed to build configuration");
 

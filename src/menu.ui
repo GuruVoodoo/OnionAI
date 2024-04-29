@@ -1,0 +1,31 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<interface>
+    <menu id="menubar">
+        <submenu>
+            <attribute name="label">File</attribute>
+            <section>
+                <item>
+                    <attribute name="label">Connect</attribute>
+                    <attribute name="action">app.connect</attribute>
+                </item>
+                <item>
+                    <attribute name="label">Configure</attribute>
+                    <attribute name="action">app.configure</attribute>
+                </item>
+                <item>
+                    <attribute name="label">Quit</attribute>
+                    <attribute name="action">app.quit</attribute>
+                </item>
+            </section>
+        </submenu>
+        <submenu>
+            <attribute name="label">Server</attribute>
+            <section>
+                <item>
+                    <attribute name="label">Start Server</attribute>
+                    <attribute name="action">app.server</attribute>
+                </item>
+            </section>
+        </submenu>
+    </menu>
+</interface>

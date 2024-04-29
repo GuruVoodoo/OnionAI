@@ -6,15 +6,18 @@ mod config;
 mod zk_proof;
 mod encryption;
 mod client;
+mod gui;
 
+use config::AppConfig;
 #[tokio::main]
 async fn main() {
+    // Initialize logging
     // Initialize logging
     error_handler::initialize_logger();
 
     // Load configuration
-    let config = config::AppConfig::new();
+    let config = AppConfig::new();
 
-    // Run the server from the node module
-    node::run_server(config).await;
+    // Run the GUI
+    gui::run_gui(config);
 }
